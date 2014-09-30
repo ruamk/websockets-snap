@@ -13,7 +13,7 @@ import           Control.Concurrent.MVar       (MVar, newEmptyMVar, putMVar,
                                                 takeMVar)
 import           Control.Exception             (Exception (..),
                                                 SomeException (..), handle,
-                                                throw, throwTo)
+                                                finally, throw, throwTo)
 import           Control.Monad                 (forever)
 import           Control.Monad.Trans           (lift)
 import           Data.ByteString               (ByteString)
@@ -21,7 +21,8 @@ import qualified Data.ByteString.Char8         as BC
 import qualified Data.ByteString.Lazy          as BL
 import qualified Data.Enumerator               as E
 import qualified Data.Enumerator.List          as EL
-import           Data.IORef                    (newIORef, readIORef, writeIORef)
+import           Data.IORef                    (IORef, newIORef, readIORef,
+                                                writeIORef)
 import           Data.Typeable                 (Typeable, cast)
 import qualified Network.WebSockets            as WS
 import qualified Network.WebSockets.Connection as WS
@@ -133,6 +134,7 @@ runWebSocketsSnapWith options app = do
         parse      <- lift $ copyMVarToStream mvar
         write      <- lift $ copyStreamToIteratee writeEnd
         stream     <- lift $ WS.makeStream parse write
+        noMorePings<- lift $ newIORef False
 
         let options' = options
                     { WS.connectionOnPong = do
@@ -143,25 +145,29 @@ runWebSocketsSnapWith options app = do
             pc = WS.PendingConnection
                     { WS.pendingOptions  = options'
                     , WS.pendingRequest  = fromSnapRequest rq
-                    , WS.pendingOnAccept = forkPingThread tickle
+                    , WS.pendingOnAccept = forkPingThread noMorePings tickle
                     , WS.pendingStream   = stream
                     }
-
-        _ <- lift $ forkIO $ app pc >> throwTo thisThread ServerAppDone
+        let runApp = finally (app pc) (writeIORef noMorePings True)
+        _ <- lift $ forkIO $ runApp >> throwTo thisThread ServerAppDone
         copyIterateeToMVar tickle mvar
 
 
 --------------------------------------------------------------------------------
 -- | Start a ping thread in the background
-forkPingThread :: ((Int -> Int) -> IO ()) -> WS.Connection -> IO ()
-forkPingThread tickle conn = do
+forkPingThread :: IORef Bool -> ((Int -> Int) -> IO ()) -> WS.Connection -> IO ()
+forkPingThread noMorePings tickle conn = do
     _ <- forkIO pingThread
     return ()
   where
     pingThread = handle ignore $ forever $ do
-        WS.sendPing conn (BC.pack "ping")
-        tickle (min 15)
-        threadDelay $ 30 * 1000 * 1000
+        stop <- readIORef noMorePings
+        case stop of
+          True -> throw ServerAppDone
+          False -> do
+            WS.sendPing conn (BC.pack "ping")
+            tickle (min 15)
+            threadDelay $ 30 * 1000 * 1000
 
     ignore :: SomeException -> IO ()
     ignore _   = return ()
